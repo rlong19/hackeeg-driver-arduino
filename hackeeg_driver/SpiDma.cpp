@@ -24,13 +24,65 @@
 #define USE_NATIVE_SAM3X_SPI 0
 
 
-#if USE_ARDUINO_SPI_LIBRARY
+#if defined(ESP32)
+
+#include <SPI.h>
+#include "adsCommand.h"
+#include "BoardConfig.h"
+
+static SPISettings g_spi_settings(8000000, MSBFIRST, SPI_MODE1);
+
+void spiBegin(uint8_t csPin) {
+    adsBusInit();
+    SPI.begin(HACKEEG_PIN_SCK, HACKEEG_PIN_MISO, HACKEEG_PIN_MOSI, -1);
+    digitalWrite(csPin, HIGH);
+    pinMode(csPin, OUTPUT);
+    digitalWrite(csPin, HIGH);
+}
+
+void spiInit(uint8_t bitOrder, uint8_t spiMode, uint8_t spiClockDivider) {
+    (void) spiClockDivider;
+    g_spi_settings = SPISettings(8000000, bitOrder, spiMode);
+}
+
+uint8_t spiRec() {
+    SPI.beginTransaction(g_spi_settings);
+    uint8_t value = SPI.transfer(0x00);
+    SPI.endTransaction();
+    return value;
+}
+
+uint8_t spiRec(uint8_t *buf, size_t len) {
+    SPI.beginTransaction(g_spi_settings);
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = SPI.transfer(0x00);
+    }
+    SPI.endTransaction();
+    return 0;
+}
+
+void spiSend(uint8_t b) {
+    SPI.beginTransaction(g_spi_settings);
+    SPI.transfer(b);
+    SPI.endTransaction();
+}
+
+void spiSend(const uint8_t *buf, size_t len) {
+    SPI.beginTransaction(g_spi_settings);
+    for (size_t i = 0; i < len; i++) {
+        SPI.transfer(buf[i]);
+    }
+    SPI.endTransaction();
+}
+
+#elif USE_ARDUINO_SPI_LIBRARY
 
 #include <SPI.h>
 
 void spiBegin(uint8_t csPin) {
     SPI.begin();
     pinMode(csPin, OUTPUT);
+    digitalWrite(csPin, HIGH);
 }
 
 void spiInit(uint8_t bitOrder, uint8_t spiMode, uint8_t spiClockDivider) {
@@ -259,7 +311,7 @@ uint8_t spiRec(uint8_t* buf, size_t len) {
 #endif  // USE_SAM3X_DMAC
 
   if (bitOrder == LSBFIRST) {
-    for (register int i=0; i<len; i++) {
+    for (int i=0; i<len; i++) {
     buf[i] = __REV(__RBIT(buf[i]));
     }
   }

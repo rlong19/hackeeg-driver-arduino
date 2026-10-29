@@ -18,6 +18,7 @@
  * along with this library.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "SerialCommand.h"
+#include "BoardConfig.h"
 
 /**
  * Constructor makes sure some things are set.
@@ -40,10 +41,10 @@ SerialCommand::SerialCommand()
 void SerialCommand::addCommand(const char *command,
                                void (*func)(unsigned char register_number, unsigned char register_value)) {
 #ifdef SERIALCOMMAND_DEBUG
-    SerialUSB.print("Adding command (");
-    SerialUSB.print(commandCount);
-    SerialUSB.print("): ");
-    SerialUSB.println(command);
+    HACKEEG_SERIAL.print("Adding command (");
+    HACKEEG_SERIAL.print(commandCount);
+    HACKEEG_SERIAL.print("): ");
+    HACKEEG_SERIAL.println(command);
 #endif
 
     commandList = (SerialCommandCallback *) realloc(commandList, (commandCount + 1) * sizeof(SerialCommandCallback));
@@ -67,17 +68,17 @@ void SerialCommand::setDefaultHandler(void (*function)(const char *)) {
  * buffer for a prefix command, and calls handlers setup by addCommand() member
  */
 void SerialCommand::readSerial() {
-    while (SerialUSB.available() > 0) {
-        char inChar = SerialUSB.read();   // Read single available character, there may be more waiting
+    while (HACKEEG_SERIAL.available() > 0) {
+        char inChar = HACKEEG_SERIAL.read();   // Read single available character, there may be more waiting
 #ifdef SERIALCOMMAND_DEBUG
-        SerialUSB.print(inChar);   // Echo back to serial stream
+        HACKEEG_SERIAL.print(inChar);   // Echo back to serial stream
 #endif
 
         inChar = tolower(inChar);
         if (inChar == term) {     // Check for the terminator (default '\r') meaning end of command
 #ifdef SERIALCOMMAND_DEBUG
-            SerialUSB.print("Received: ");
-            SerialUSB.println(buffer);
+            HACKEEG_SERIAL.print("Received: ");
+            HACKEEG_SERIAL.println(buffer);
 #endif
 
             char *command = strtok_r(buffer, delim, &last);   // Search for command at start of buffer
@@ -86,18 +87,18 @@ void SerialCommand::readSerial() {
 
                 for (int i = 0; i < commandCount; i++) {
 #ifdef SERIALCOMMAND_DEBUG
-                    SerialUSB.print("Comparing [");
-                    SerialUSB.print(command);
-                    SerialUSB.print("] to [");
-                    SerialUSB.print(commandList[i].command);
-                    SerialUSB.println("]");
+                    HACKEEG_SERIAL.print("Comparing [");
+                    HACKEEG_SERIAL.print(command);
+                    HACKEEG_SERIAL.print("] to [");
+                    HACKEEG_SERIAL.print(commandList[i].command);
+                    HACKEEG_SERIAL.println("]");
 #endif
 
                     // Compare the found command against the list of known commands for a match
                     if (strncmp(command, commandList[i].command, SERIALCOMMAND_MAXCOMMANDLENGTH) == 0) {
 #ifdef SERIALCOMMAND_DEBUG
-                        SerialUSB.print("Matched Command: ");
-                        SerialUSB.println(command);
+                        HACKEEG_SERIAL.print("Matched Command: ");
+                        HACKEEG_SERIAL.println(command);
 #endif
 
                         // Execute the stored handler function for the command
@@ -149,6 +150,6 @@ char *SerialCommand::next() {
 
 void SerialCommand::printCommands() {
     for (int i = 0; i < commandCount; i++) {
-        SerialUSB.println(commandList[i].command);
+        HACKEEG_SERIAL.println(commandList[i].command);
     }
 }

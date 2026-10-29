@@ -21,7 +21,66 @@
 #include "Arduino.h"
 #include "adsCommand.h"
 #include "ads129x.h"
+#include "AdsControl.h"
 #include "SpiDma.h"
+
+#if defined(ESP32)
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+static SemaphoreHandle_t g_spi_mutex = nullptr;
+static volatile bool g_acquiring = false;
+#else
+static bool g_acquiring = false;
+#endif
+
+void adsBusInit() {
+#if defined(ESP32)
+    if (g_spi_mutex == nullptr) {
+        g_spi_mutex = xSemaphoreCreateRecursiveMutex();
+    }
+#endif
+}
+
+void adsBusLock() {
+#if defined(ESP32)
+    if (g_spi_mutex == nullptr) {
+        adsBusInit();
+    }
+    if (g_spi_mutex != nullptr) {
+        xSemaphoreTakeRecursive(g_spi_mutex, portMAX_DELAY);
+    }
+#endif
+}
+
+void adsBusUnlock() {
+#if defined(ESP32)
+    if (g_spi_mutex != nullptr) {
+        xSemaphoreGiveRecursive(g_spi_mutex);
+    }
+#endif
+}
+
+void adsSetAcquiring(bool on) {
+    g_acquiring = on;
+}
+
+bool adsAcquiring() {
+    return g_acquiring;
+}
+
+static void csLow() {
+    digitalWrite(PIN_CS, LOW);
+#if defined(ESP32)
+    delayMicroseconds(4);
+#endif
+}
+
+static void csHigh() {
+    digitalWrite(PIN_CS, HIGH);
+#if defined(ESP32)
+    delayMicroseconds(4);
+#endif
+}
 
 /*void wait_for_drdy(int interval)
 {
@@ -35,38 +94,75 @@
 }*/
 
 void adcSendCommand(int cmd) {
-    digitalWrite(PIN_CS, LOW);
-    spiSend(cmd);
+    adsBusLock();
+    csLow();
+    spiSend((uint8_t) cmd);
     delayMicroseconds(1);
-    digitalWrite(PIN_CS, HIGH);
+    csHigh();
+    adsBusUnlock();
 }
 
 void adcSendCommandLeaveCsActive(int cmd) {
-    digitalWrite(PIN_CS, LOW);
-    spiSend(cmd);
+    adsBusLock();
+    csLow();
+    spiSend((uint8_t) cmd);
+    adsBusUnlock();
+}
+
+static void resumeContinuous() {
+#if defined(ESP32)
+    if (!g_acquiring) {
+        return;
+    }
+    delayMicroseconds(4);
+    csLow();
+    spiSend(ADS129x::RDATAC);
+    delayMicroseconds(2);
+    csHigh();
+#endif
+}
+
+static void pauseContinuous() {
+#if defined(ESP32)
+    if (!g_acquiring) {
+        return;
+    }
+    csLow();
+    spiSend(ADS129x::SDATAC);
+    delayMicroseconds(2);
+    csHigh();
+    delayMicroseconds(4);
+#endif
 }
 
 void adcWreg(int reg, int val) {
-    //see pages 40,43 of datasheet -
-    digitalWrite(PIN_CS, LOW);
-    spiSend(ADS129x::WREG | reg);
+    adsBusLock();
+    pauseContinuous();
+    csLow();
+    spiSend((uint8_t) (ADS129x::WREG | reg));
     delayMicroseconds(2);
-    spiSend(0);    // number of registers to be read/written – 1
+    spiSend(0);
     delayMicroseconds(2);
-    spiSend(val);
+    spiSend((uint8_t) val);
     delayMicroseconds(1);
-    digitalWrite(PIN_CS, HIGH);
+    csHigh();
+    adsNoteRegisterWrite(reg, val);
+    resumeContinuous();
+    adsBusUnlock();
 }
 
 int adcRreg(int reg) {
-    uint8_t out = 0;
-    digitalWrite(PIN_CS, LOW);
-    spiSend(ADS129x::RREG | reg);
+    adsBusLock();
+    pauseContinuous();
+    csLow();
+    spiSend((uint8_t) (ADS129x::RREG | reg));
     delayMicroseconds(2);
-    spiSend(0);    // number of registers to be read/written – 1
+    spiSend(0);
     delayMicroseconds(2);
-    out = spiRec();
+    uint8_t out = spiRec();
     delayMicroseconds(1);
-    digitalWrite(PIN_CS, HIGH);
-    return ((int) out);
+    csHigh();
+    resumeContinuous();
+    adsBusUnlock();
+    return (int) out;
 }
