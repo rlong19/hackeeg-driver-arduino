@@ -21,6 +21,7 @@
 
 #include <SPI.h>
 #include <stdlib.h>
+#include <string.h>
 #include <ArduinoJson.h>
 #include "adsCommand.h"
 #include "ads129x.h"
@@ -28,17 +29,20 @@
 #include "JsonCommand.h"
 #include "Base64.h"
 #include "SpiDma.h"
+#include "BoardConfig.h"
+#include "DriverState.h"
+#include "AdsControl.h"
+#include "SampleEngine.h"
+#include "OpenBciLink.h"
 
+#define WiredSerial HACKEEG_SERIAL
 
-#define BAUD_RATE 2000000     // WiredSerial ignores this and uses the maximum rate
-#define WiredSerial SerialUSB // use the Arduino Due's Native USB port
+#if defined(ESP32)
+SET_LOOP_TASK_STACK_SIZE(16384);
+#endif
 
 #define SPI_BUFFER_SIZE 200
 #define OUTPUT_BUFFER_SIZE 1000
-
-#define TEXT_MODE 0
-#define JSONLINES_MODE 1
-#define MESSAGEPACK_MODE 2
 
 #define RESPONSE_OK 200
 #define RESPONSE_BAD_REQUEST 400
@@ -61,6 +65,12 @@ int num_spi_bytes = 0;
 int num_timestamped_spi_bytes = 0;
 boolean is_rdatac = false;
 boolean base64_mode = true;
+bool id_valid = false;
+uint8_t ads_id = 0;
+bool channels_forced = false;
+static bool wifi_stream = false;
+static bool spp_stream = false;
+static bool acq_on = false;
 
 char hexDigits[] = "0123456789ABCDEF";
 
@@ -88,7 +98,7 @@ char output_buffer[OUTPUT_BUFFER_SIZE];
 const char *hardware_type = "unknown";
 const char *board_name = "HackEEG";
 const char *maker_name = "Starcat LLC";
-const char *driver_version = "v0.3.0";
+const char *driver_version = HACKEEG_FIRMWARE_VERSION;
 
 
 const char *json_rdatac_header= "{\"C\":200,\"D\":\"";
@@ -135,12 +145,20 @@ void writeRegisterCommandDirect(unsigned char register_number, unsigned char reg
 
 
 void setup() {
-    WiredSerial.begin(BAUD_RATE);
+#if defined(ESP32)
+    WiredSerial.setTxBufferSize(4096);
+    WiredSerial.begin(115200);
+#else
+    WiredSerial.begin(2000000);
+#endif
     pinMode(PIN_LED, OUTPUT);     // Configure the onboard LED for output
     digitalWrite(PIN_LED, LOW);   // default to LED off
 
     protocol_mode = TEXT_MODE;
     arduinoSetup();
+#if defined(ESP32)
+    sampleEngineBegin();
+#endif
     adsSetup();
 
     // Setup callbacks for SerialCommand commands
@@ -194,6 +212,12 @@ void setup() {
     jsonCommand.addCommand("rdata", rdataCommand);                   // Read one sample of data from each active channel
     jsonCommand.setDefaultHandler(unrecognizedJsonLines);            // Handler for any command that isn't matched
 
+    adsControlSetStreamHook(hackeegArmStream);
+    hackeegAddExtensionCommands();
+#if defined(ESP32)
+    openBciSetup();
+#endif
+
     WiredSerial.println("Ready");
 }
 
@@ -210,7 +234,11 @@ void loop() {
             // do nothing
             ;
     }
+#if defined(ESP32)
+    openBciLoop();
+#else
     send_samples();
+#endif
 }
 
 long hex_to_long(char *digits) {
@@ -232,10 +260,10 @@ void output_hex_byte(int value) {
 }
 
 void encode_hex(char *output, char *input, int input_len) {
-    register int count = 0;
-    for (register int i = 0; i < input_len; i++) {
-        register uint8_t low_nybble = input[i] & 0x0f;
-        register uint8_t highNybble = input[i] >> 4;
+    int count = 0;
+    for (int i = 0; i < input_len; i++) {
+        uint8_t low_nybble = input[i] & 0x0f;
+        uint8_t highNybble = input[i] >> 4;
         output[count++] = hexDigits[highNybble];
         output[count++] = hexDigits[low_nybble];
     }
@@ -253,8 +281,8 @@ void send_response_error() {
 void send_response(int status_code, const char *status_text) {
     switch (protocol_mode) {
         case TEXT_MODE:
-            char response[128];
-            sprintf(response, "%d %s", status_code, status_text);
+            char response[400];
+            snprintf(response, sizeof(response), "%d %s", status_code, status_text);
             WiredSerial.println(response);
             break;
         case JSONLINES_MODE:
@@ -275,7 +303,7 @@ void send_jsonlines_data(int status_code, char data, char *status_text) {
     JsonObject root = doc.to<JsonObject>();
     root[STATUS_CODE_KEY] = status_code;
     root[STATUS_TEXT_KEY] = status_text;
-    root[DATA_KEY] = data;
+    root[DATA_KEY] = (int) (unsigned char) data;
     serializeJson(doc, WiredSerial);
     WiredSerial.println();
     doc.clear();
@@ -301,6 +329,17 @@ void statusCommand(unsigned char unused1, unsigned char unused2) {
         WiredSerial.println(max_channels);
         WiredSerial.print("Number of active channels: ");
         WiredSerial.println(num_active_channels);
+        WiredSerial.print("ADS ID: 0x");
+        output_hex_byte(ads_id);
+        WiredSerial.println();
+        WiredSerial.print("Sample rate: ");
+        WiredSerial.println(adsControlSampleRateHz());
+        WiredSerial.print("Ring dropped: ");
+        WiredSerial.println(sampleEngineRingDropped());
+        WiredSerial.print("DRDY missed: ");
+        WiredSerial.println(sampleEngineDrdyMissed());
+        WiredSerial.print("Radio dropped: ");
+        WiredSerial.println(sampleEngineRadioDropped());
         WiredSerial.println();
         return;
     }
@@ -315,6 +354,12 @@ void statusCommand(unsigned char unused1, unsigned char unused2) {
     status_info["hardware_type"] = hardware_type;
     status_info["max_channels"] = max_channels;
     status_info["active_channels"] = num_active_channels;
+    status_info["ads_id"] = ads_id;
+    status_info["id_valid"] = id_valid;
+    status_info["sample_rate_hz"] = adsControlSampleRateHz();
+    status_info["ring_dropped"] = sampleEngineRingDropped();
+    status_info["drdy_missed"] = sampleEngineDrdyMissed();
+    status_info["radio_dropped"] = sampleEngineRadioDropped();
     switch (protocol_mode) {
         case JSONLINES_MODE:
         case MESSAGEPACK_MODE:
@@ -414,6 +459,10 @@ void helpCommand(unsigned char unused1, unsigned char unused2) {
         WiredSerial.println("200 Ok");
         WiredSerial.println("Available commands: ");
         serialCommand.printCommands();
+#if defined(ESP32)
+        WiredSerial.println("Radio extension (WiFi /command, TCP, Bluetooth): |command args|");
+        WiredSerial.println("Example: |rreg 00|  |wreg 03 EC|  |srb1 on|  |samplerate 250|");
+#endif
         WiredSerial.println();
     }
 }
@@ -509,9 +558,7 @@ void standbyCommand(unsigned char unused1, unsigned char unused2) {
 }
 
 void resetCommand(unsigned char unused1, unsigned char unused2) {
-    using namespace ADS129x;
-    adcSendCommand(RESET);
-    adsSetup();
+    hackeegRebootAds();
     send_response_ok();
 }
 
@@ -530,12 +577,32 @@ void stopCommand(unsigned char unused1, unsigned char unused2) {
 
 void rdataCommand(unsigned char unused1, unsigned char unused2) {
     using namespace ADS129x;
+#if defined(ESP32)
+    uint8_t raw[27];
+    int nbytes = num_spi_bytes;
+    if (nbytes < 3) {
+        nbytes = 3;
+    }
+    if (nbytes > (int) sizeof(raw)) {
+        nbytes = (int) sizeof(raw);
+    }
+    char err[64];
+    if (!adsControlReadFrame(raw, nbytes, err, sizeof(err))) {
+        send_response(RESPONSE_BAD_REQUEST, err);
+        return;
+    }
+    if (protocol_mode == TEXT_MODE) {
+        send_response_ok();
+    }
+    hackeegEmitUsbSample(micros(), sample_number_union.sample_number++, raw, (uint8_t) nbytes, true);
+#else
     while (digitalRead(IPIN_DRDY) == HIGH);
     adcSendCommandLeaveCsActive(RDATA);
     if (protocol_mode == TEXT_MODE) {
         send_response_ok();
     }
     send_sample();
+#endif
 }
 
 void rdatacCommand(unsigned char unused1, unsigned char unused2) {
@@ -543,7 +610,12 @@ void rdatacCommand(unsigned char unused1, unsigned char unused2) {
     detectActiveChannels();
     if (num_active_channels > 0) {
         is_rdatac = true;
+#if defined(ESP32)
+        refreshAcquisition();
+#else
+        adsSetAcquiring(true);
         adcSendCommand(RDATAC);
+#endif
         send_response_ok();
     } else {
         send_response(RESPONSE_NO_ACTIVE_CHANNELS, STATUS_TEXT_NO_ACTIVE_CHANNELS);
@@ -553,8 +625,12 @@ void rdatacCommand(unsigned char unused1, unsigned char unused2) {
 void sdatacCommand(unsigned char unused1, unsigned char unused2) {
     using namespace ADS129x;
     is_rdatac = false;
+#if defined(ESP32)
+    refreshAcquisition();
+#else
+    adsSetAcquiring(false);
     adcSendCommand(SDATAC);
-    using namespace ADS129x;
+#endif
     send_response_ok();
 }
 
@@ -574,7 +650,7 @@ void unrecognizedJsonLines(const char *command) {
 }
 
 void detectActiveChannels() {  //set device into RDATAC (continous) mode -it will stream data
-    if ((is_rdatac) || (max_channels < 1)) return; //we can not read registers when in RDATAC mode
+    if (adsAcquiring() || (max_channels < 1)) return; //we can not read registers when in RDATAC mode
     //Serial.println("Detect active channels: ");
     using namespace ADS129x;
     num_active_channels = 0;
@@ -660,81 +736,98 @@ inline void send_sample_messagepack(int num_bytes) {
     WiredSerial.write(spi_bytes, num_bytes);
 }
 
-void adsSetup() { //default settings for ADS1298 and compatible chips
+void adsSetup() { //default settings for ADS1299 and compatible chips
     using namespace ADS129x;
-    // Send SDATAC Command (Stop Read Data Continuously mode)
     spi_data_available = 0;
+#if defined(ESP32)
+    sampleEngineAttach();
+#else
     attachInterrupt(digitalPinToInterrupt(IPIN_DRDY), drdy_interrupt, FALLING);
+#endif
     adcSendCommand(SDATAC);
+#if defined(ESP32)
+    delay(10);
+#else
     delay(1000); //pause to provide ads129n enough time to boot up...
-    // delayMicroseconds(2);
     delay(100);
+#endif
     int val = adcRreg(ID);
-    switch (val & B00011111) {
-        case B10000:
-            hardware_type = "ADS1294";
-            max_channels = 4;
-            break;
-        case B10001:
-            hardware_type = "ADS1296";
-            max_channels = 6;
-            break;
-        case B10010:
-            hardware_type = "ADS1298";
-            max_channels = 8;
-            break;
-        case B11110:
-            hardware_type = "ADS1299";
-            max_channels = 8;
-            break;
-        case B11100:
-            hardware_type = "ADS1299-4";
-            max_channels = 4;
-            break;
-        case B11101:
-            hardware_type = "ADS1299-6";
-            max_channels = 6;
-            break;
-        default:
-            max_channels = 0;
+#if defined(ESP32)
+    for (int attempt = 0; attempt < 4 && adsDecodeId((uint8_t) val, nullptr) == 0; attempt++) {
+        delay(20);
+        val = adcRreg(ID);
     }
-    num_spi_bytes = (3 * (max_channels + 1)); //24-bits header plus 24-bits per channel
-    num_timestamped_spi_bytes = num_spi_bytes + TIMESTAMP_SIZE_IN_BYTES + SAMPLE_NUMBER_SIZE_IN_BYTES;
-    if (max_channels == 0) { //error mode
+#endif
+    const char *decoded = "unrecognized";
+    int decoded_channels = adsDecodeId((uint8_t) val, &decoded);
+    ads_id = (uint8_t) val;
+    hardware_type = decoded;
+    id_valid = decoded_channels > 0;
+    max_channels = decoded_channels;
+#if HACKEEG_CHANNEL_COUNT == 4 || HACKEEG_CHANNEL_COUNT == 6 || HACKEEG_CHANNEL_COUNT == 8
+    max_channels = HACKEEG_CHANNEL_COUNT;
+    channels_forced = true;
+#endif
+    if (max_channels == 0) {
+#if defined(ESP32)
+        max_channels = 6;
+        hardware_type = "ADS1299-6 (assumed)";
+#else
         while (1) {
             digitalWrite(PIN_LED, HIGH);
             delay(500);
             digitalWrite(PIN_LED, LOW);
             delay(500);
         }
-    } //error mode
+#endif
+    }
+    num_spi_bytes = (3 * (max_channels + 1)); //24-bit status plus 24 bits per channel
+    num_timestamped_spi_bytes = num_spi_bytes + TIMESTAMP_SIZE_IN_BYTES + SAMPLE_NUMBER_SIZE_IN_BYTES;
 
     // All GPIO set to output 0x0000: (floating CMOS inputs can flicker on and off, creating noise)
     adcWreg(GPIO, 0);
-    adcWreg(CONFIG3,PD_REFBUF | CONFIG3_const);
+#if defined(ESP32)
+    adsControlApplyDefaults();
+    digitalWrite(PIN_START, LOW);
+    detectActiveChannels();
+#else
+    adcWreg(CONFIG3, PD_REFBUF | CONFIG3_const);
     digitalWrite(PIN_START, HIGH);
+#endif
 }
 
 void arduinoSetup() {
     pinMode(PIN_LED, OUTPUT);
     using namespace ADS129x;
-    // prepare pins to be outputs or inputs
-    //pinMode(PIN_SCLK, OUTPUT); //optional - SPI library will do this for us
-    //pinMode(PIN_DIN, OUTPUT); //optional - SPI library will do this for us
-    //pinMode(PIN_DOUT, INPUT); //optional - SPI library will do this for us
-    //pinMode(PIN_CS, OUTPUT);
     pinMode(PIN_START, OUTPUT);
     pinMode(IPIN_DRDY, INPUT);
-    pinMode(PIN_CLKSEL, OUTPUT);// *optional
-    pinMode(IPIN_RESET, OUTPUT);// *optional
-    //pinMode(IPIN_PWDN, OUTPUT);// *optional
-    digitalWrite(PIN_CLKSEL, HIGH); // internal clock
+    pinMode(IPIN_RESET, OUTPUT);
+    digitalWrite(PIN_START, LOW);
+    if (PIN_CLKSEL >= 0) {
+        pinMode(PIN_CLKSEL, OUTPUT);
+        digitalWrite(PIN_CLKSEL, HIGH); // internal clock
+    }
+#if defined(ESP32)
+    pinMode(IPIN_PWDN, OUTPUT);
+    digitalWrite(IPIN_PWDN, LOW);
+    delay(10);
+    digitalWrite(IPIN_PWDN, HIGH);
+    digitalWrite(IPIN_RESET, LOW);
+    spiBegin(PIN_CS);
+    spiInit(MSBFIRST, SPI_MODE1, SPI_CLOCK_DIVIDER);
+    // tPOR is 128 ms at 2.048 MHz; the datasheet's typical power-up wait is 150 ms.
+    delay(150);
+    digitalWrite(IPIN_RESET, HIGH);
+    delayMicroseconds(40); // more than 18 tCLK after RESET rises
+#else
     //start Serial Peripheral Interface
     spiBegin(PIN_CS);
     spiInit(MSBFIRST, SPI_MODE1, SPI_CLOCK_DIVIDER);
     //Start ADS1298
     delay(500); //wait for the ads129n to be ready - it can take a while to charge caps
-    digitalWrite(PIN_CLKSEL, HIGH);// *optional
+    if (PIN_CLKSEL >= 0) {
+        digitalWrite(PIN_CLKSEL, HIGH);
+    }
     delay(10); // wait for oscillator to wake up
     digitalWrite(IPIN_PWDN, HIGH); // *optional - turn off power down mode
     digitalWrite(IPIN_RESET, HIGH);
@@ -743,4 +836,114 @@ void arduinoSetup() {
     delay(1);
     digitalWrite(IPIN_RESET, HIGH);
     delay(1);  // *optional Wait for 18 tCLKs AKA 9 microseconds, we use 1 millisecond
+#endif
+}
+
+static int normalizeStreamSource(int source) {
+    if (source == HACKEEG_STREAM_SPP) {
+        return HACKEEG_STREAM_SPP;
+    }
+    if (source == HACKEEG_STREAM_USB) {
+        return HACKEEG_STREAM_USB;
+    }
+    return HACKEEG_STREAM_WIFI;
+}
+
+void hackeegArmStream(int source, bool on) {
+#if defined(ESP32)
+    source = normalizeStreamSource(source);
+    if (source == HACKEEG_STREAM_USB) {
+        is_rdatac = on;
+    } else if (source == HACKEEG_STREAM_SPP) {
+        spp_stream = on;
+    } else {
+        wifi_stream = on;
+    }
+    refreshAcquisition();
+#else
+    (void) source;
+    (void) on;
+#endif
+}
+
+bool hackeegWifiStreaming() {
+    return wifi_stream;
+}
+
+bool hackeegSppStreaming() {
+    return spp_stream;
+}
+
+void refreshAcquisition() {
+#if defined(ESP32)
+    using namespace ADS129x;
+    bool want = is_rdatac || wifi_stream || spp_stream;
+    if (want == acq_on) {
+        return;
+    }
+    if (want) {
+        detectActiveChannels();
+        adsBusLock();
+        sampleEngineResetCounter();
+        sampleEngineClearNotify();
+        adsBusUnlock();
+        adcSendCommand(RDATAC);
+        digitalWrite(PIN_START, HIGH);
+        adcSendCommand(START);
+        adsSetAcquiring(true);
+        sampleEngineSetCapture(true);
+        acq_on = true;
+    } else {
+        sampleEngineSetCapture(false);
+        adsBusLock();
+        sampleEngineDiscard();
+        adsBusUnlock();
+        adsSetAcquiring(false);
+        adcSendCommand(STOP);
+        digitalWrite(PIN_START, LOW);
+        adcSendCommand(SDATAC);
+        acq_on = false;
+    }
+#else
+    (void) acq_on;
+#endif
+}
+
+void hackeegRebootAds() {
+    using namespace ADS129x;
+#if defined(ESP32)
+    is_rdatac = false;
+    wifi_stream = false;
+    spp_stream = false;
+    refreshAcquisition();
+    digitalWrite(IPIN_RESET, LOW);
+    delay(2);
+    digitalWrite(IPIN_RESET, HIGH);
+    delay(20);
+    adsSetup();
+#else
+    adcSendCommand(RESET);
+    adsSetup();
+#endif
+}
+
+void hackeegEmitUsbSample(uint32_t timestamp, uint32_t sampleNumber, const uint8_t *raw, uint8_t rawLen, bool force) {
+    if (!is_rdatac && !force) {
+        return;
+    }
+    if (rawLen > SPI_BUFFER_SIZE - 8) {
+        rawLen = SPI_BUFFER_SIZE - 8;
+    }
+    timestamp_union.timestamp = timestamp;
+    sample_number_union.sample_number = sampleNumber;
+    memcpy(spi_bytes, timestamp_union.timestamp_bytes, TIMESTAMP_SIZE_IN_BYTES);
+    memcpy(spi_bytes + TIMESTAMP_SIZE_IN_BYTES, sample_number_union.sample_number_bytes, SAMPLE_NUMBER_SIZE_IN_BYTES);
+    memset(spi_bytes + 8, 0, (size_t) num_spi_bytes);
+    if (raw != nullptr && rawLen > 0) {
+        memcpy(spi_bytes + 8, raw, rawLen);
+    }
+    int saved = num_timestamped_spi_bytes;
+    num_timestamped_spi_bytes = 8 + rawLen;
+    send_sample();
+    num_timestamped_spi_bytes = saved;
 } 

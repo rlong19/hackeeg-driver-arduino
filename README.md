@@ -8,7 +8,9 @@ The [TI ADS1299](http://www.ti.com/product/ads1299) is a 24-bit 8-channel ADC me
 
 The src/ directory contains an Arduino sketch and associated C/C++ files that make up a driver for ADS129x chips. So far it has only been tested on the ADS1299, but should work on the other models. This driver has been tested on the Arduino Due and Mega2560, but should also work on other Arduinos. The DMA mode can only be used on the Arduino Due.
 
-The driver has a text-mode interface, so can be used without any client software – just open up a serial port to the SAM3X8E native USB port (line endings NL+CR). It also has a JSONLines mode for easy parsing by client programs and a MessagePack mode for efficient binary communication. 
+The driver has a text-mode interface, so can be used without any client software – just open up a serial port to the SAM3X8E native USB port (line endings NL+CR). It also has a JSONLines mode for easy parsing by client programs and a MessagePack mode for efficient binary communication.
+
+The same sketch builds for the original ESP32 (ESP32-WROOM-32 on an ESP32-DevKitC or a similar board). USB serial keeps this HackEEG protocol. WiFi and classic Bluetooth SPP speak the OpenBCI Cyton protocol so BrainFlow and the OpenBCI GUI can connect. See [ESP32 WiFi and Bluetooth](#esp32-wifi-and-bluetooth). 
 
 In MessagePack mode, using the Arduino Due's native SPI DMA, driver can read from the ADS1299 at 16,000 samples per second, and can send that data on to the host via the Arduino Due's USB 2.0 High Speed connection at the same rate. 
 
@@ -21,7 +23,7 @@ In text mode, samples are encoded using the [base64](http://en.wikipedia.org/wik
 
 ## Installing
 
-You must install the [ArduinoJson](https://arduinojson.org/v6/doc/installation/) library before compiling this driver.
+You must install [ArduinoJson 6](https://arduinojson.org/v6/doc/installation/) before compiling this driver (6.21.5 is known to build). ArduinoJson 7 uses a different API and will not compile this sketch.
 
 
 ## Using the Driver
@@ -46,6 +48,7 @@ Returns a single hex-encoded byte (for example, 0E) that represents the contents
 * MESSAGEPACK – communication protocol switches from text to [MessagePack](https://msgpack.org) for `rdatac` data only. This is a concise binary serialization format with libraries in many languages. See the Communication Protocol section.
 * HEX – RDATA commands will encode data in hexidecimal format.
 * HELP – prints a list of available commands.
+* On every board, text mode also accepts the analog-front-end commands documented under [HackEEG pipe commands](#hackeeg-pipe-commands) (`srb1`, `bias`, `loff`, `testsignal`, `gain`, `samplerate`, `channels`, `defaults`, `dropped`, and the rest). JSON mode still uses `rreg` / `wreg` for those registers.
 
 
 
@@ -278,6 +281,220 @@ to [Lab Streaming Layer](https://github.com/sccn/labstreaminglayer) at 16,000 sa
 
 If you are looking for a full Arduino shield with analog input capability, you might be interested in the 
 [HackEEG Shield](https://github.com/adamfeuer/hackeeg-shield). The HackEEG shield is designed for use with the ADS1299.
+
+## ESP32 WiFi and Bluetooth
+
+The sketch `hackeeg_driver/hackeeg_driver.ino` is the ESP32 firmware as well as the Due firmware. On the original ESP32 it keeps the HackEEG text, JSON Lines, and MessagePack protocol on USB serial, and adds the OpenBCI Cyton stream on WiFi and classic Bluetooth SPP.
+
+ESP32-S2, S3, C3, and C6 are not targets. They do not have Bluetooth Classic.
+
+### Wiring
+
+SPI is mode 1, MSB first, SCLK 8 MHz. MOSI drives ADS1299 DIN. MISO reads DOUT. CS is a GPIO, not the SPI peripheral's automatic chip select. DRDY is a falling-edge interrupt. PWDN and RESET are active low. START stays low until a stream starts.
+
+Tie CLKSEL high for the internal 2.048 MHz oscillator, and tie DAISY_IN to DGND when this is the only device. The firmware turns on the internal 4.5 V reference and, on the ESP32, the bias amplifier. It does not build the analog bias network; that has to already be on the board. GPIO 5 is a strapping pin and must be high at reset, which matches CS idle-high. Do not use GPIO 0, 2, 12, or 15 for the ADS1299. GPIO 2 is the DevKit LED.
+
+These are the default GPIOs (change any of them with `-DHACKEEG_PIN_DRDY=34` and the matching `HACKEEG_PIN_*` names):
+
+| ESP32 GPIO | ADS1299 | Notes |
+| --- | --- | --- |
+| 18 | SCLK | VSPI SCK on the ESP32-DevKitC. On an Adafruit ESP32 Feather V2 this is GPIO 18, not the pin labeled SCK. |
+| 23 | DIN | MOSI. |
+| 19 | DOUT | MISO. |
+| 5 | CS | Active low. Idle high. |
+| 27 | DRDY | Falling edge. Digital input; WiFi does not prevent that. |
+| 25 | START | Driven low until streaming. |
+| 26 | RESET | Active low pulse at boot. |
+| 32 | PWDN | Active low. On the Feather V2 this pin is the battery divider; move PWDN to GPIO 33 with `-DHACKEEG_PIN_PWDN=33` on that board. |
+| GND | DGND, AGND | Common ground. |
+| 3.3 V | DVDD | AVDD / AVSS stay on the analog board. |
+
+### What the ESP32 does at boot
+
+1. Drive PWDN high and hold RESET low for 150 ms (`tPOR` is 128 ms at 2.048 MHz).
+2. Release RESET and wait more than 18 tCLK.
+3. Send SDATAC before any register access. The part wakes in RDATAC.
+4. Read ID. `0x3C` / `0x3D` / `0x3E` are ADS1299-4 / ADS1299-6 / ADS1299 (later revisions with the same channel bits are accepted). The SPI frame is 15, 21, or 27 bytes.
+5. If the ID is not recognized, the frame still defaults to 6 channels so an ADS1299-6 can be forced on, and `/board` reports `board_connected` false until the ID is valid or you send `|channels 6|`. `-DHACKEEG_CHANNEL_COUNT=6` (or 4 or 8) forces the frame size at compile time and marks the board connected.
+6. Apply a referential default: 250 SPS, gain 24, normal inputs, SRB1 closed, SRB2 open, bias amp on, every present channel in BIAS_SENSP and BIAS_SENSN. The internal reference is given 150 ms to settle.
+7. USB then prints diagnostic lines that start with `#`, and finally `Ready`. A HackEEG client should read until the line `Ready`.
+
+Due behavior is unchanged: the same ID decode, the same shield pins, and no OpenBCI default register write. An unrecognized ID still blinks the LED and waits. Teensy uses `Serial` and the control pins CS 10, DRDY 2, START 6, RESET 5, PWDN 3, with hardware SPI on 13/11/12. That pin map is in the sketch; this tree was compile-checked for the ESP32 and the Due.
+
+### OpenBCI packets
+
+WiFi and Bluetooth send the [Cyton 33-byte frame](https://docs.openbci.com/Cyton/CytonDataFormat/):
+
+| Bytes | Contents |
+| --- | --- |
+| 0 | `0xA0` |
+| 1 | Sample number, 0–255, wrapping. Gaps mean a missed DRDY or a dropped packet. |
+| 2–25 | Eight 24-bit signed samples, MSB first. Channels the chip does not have, and channels that are powered down, are zero. |
+| 26–31 | Zeros. There is no accelerometer, so the GUI accel traces sit at 0. |
+| 32 | `0xC0` |
+
+`/board` reports `num_channels` 8 because the packet is 8 wide. `chip_channels` is the ADS1299 width (6 on an ADS1299-6). The GUI scale is `µV = count * (4.5 / 8388607 / gain) * 1e6` with gain 24.
+
+ASCII commands, only while that transport is not streaming binary (a reply would otherwise land in the middle of a packet). HTTP `/command` always returns the text in JSON, including during a stream.
+
+| Command | Effect |
+| --- | --- |
+| `b` / `s` | Start or stop the binary stream on that transport. |
+| `v` | Reset the ADS1299, rewrite the referential defaults, print the banner. |
+| `V` | Print `HackEEG v0.4.0$$$`. |
+| `?` | Read registers `0x00`–`0x17`, then `$$$`. |
+| `xCHPDGAININBIASSRB2SRB1X` | One channel, same character codes as the Cyton SDK. Example: `x1060101X` is channel 1, power on, gain 24, normal input, bias on, SRB2 off, SRB1 on. |
+| `1`–`8` and `!@#$%^&*` | Power a channel down or up. Power-down also shorts that input. |
+| `d` / `D` | Restore the referential default, or report it as `060101$$$`. |
+| `~0` … `~6` or `~~` | Set or query the data rate. `0` = 16 kSPS … `6` = 250 SPS. `~4` is 1000 SPS. |
+| `z(channel)(P)(N)Z` | Lead-off sense for one channel, then `$$$`. |
+| `0` `-` `=` `[` `]` `p` | Internal test signal: ground, slow 1x, fast 1x, slow 2x, fast 2x, DC. |
+| `|...|` | HackEEG extension. See below. |
+
+`c` acknowledges the 8-channel packet. `C` (daisy) and the SD-card letters are consumed and refused so the parser stays aligned. `{` `}` `:` `;` are the Cyton WiFi-shield attach commands and are ignored. Startup text on Bluetooth ends with `$$$`.
+
+### HackEEG pipe commands
+
+OpenBCI commands are single bytes, or a short framed sequence (`x`…`X`, `z`…`Z`, `~` plus one character). A second protocol has to use a character OpenBCI does not use, and must not interpret the bytes inside the frame as `b`, `s`, `x`, or `~`.
+
+The extension frame is a pair of pipe characters:
+
+```text
+|rreg 00|
+|wreg 03 EC|
+|srb1 on|
+|samplerate 1000|
+```
+
+`|` is not a Cyton command. Bytes between the pipes are the HackEEG command and are not parsed as OpenBCI. A newline also closes the frame, so `|status` and Enter works from a terminal. Commands are case-insensitive. The reply, when the transport is idle, is one line `|200 ...|` or `|400 ...|`. HTTP `/command` puts that same text in the JSON body.
+
+Send it as the Cyton command string. WiFi:
+
+```json
+{"command":"|wreg 05 60|"}
+```
+
+TCP (the socket the board opened to your computer) and Bluetooth SPP take the same bytes. Do not echo the binary sample stream back into that socket; sample bytes would be parsed as commands.
+
+While that transport is streaming raw packets, text replies are not written onto it. The command still runs. Use HTTP `/command` to read the reply during a stream. `/stream/start` and `b` do not prefix the TCP stream with an acknowledgement, so the first byte BrainFlow sees is `0xA0`.
+
+`|start|` and `|stop|` are the ADS1299 SPI opcodes, same as the USB `start` and `stop` commands. They do not by themselves turn the OpenBCI packet stream on or off. `|rdatac|` and `|sdatac|`, and OpenBCI `b` / `s`, do that. `|rdatac|` from Bluetooth arms Bluetooth only; `|rdatac|` from HTTP or TCP arms WiFi only; USB `rdatac` arms the HackEEG USB stream only. One conversion feeds every stream that is armed.
+
+| Command | Arguments | Effect |
+| --- | --- | --- |
+| `help` | | List the extension commands. |
+| `version` `status` `micros` `serialnumber` `nop` | | Same ideas as the USB commands. `serialnumber` is still unimplemented. |
+| `rreg` | hex register | Read one register. Reply is the byte in hex. |
+| `wreg` | hex register, hex value | Write one register. Register access during a stream sends SDATAC, writes, then RDATAC. |
+| `rdata` | | One SPI frame, hex, when not streaming. |
+| `rdatac` `sdatac` | | Arm or disarm the OpenBCI stream on the transport that sent it. |
+| `start` `stop` `wakeup` `standby` `reset` | | ADS1299 opcodes. `reset` also rewrites the referential defaults. |
+| `channels` | `4`, `6`, or `8` | SPI frame size. Omit the number to query. This stops and restarts an active stream. |
+| `samplerate` | `250` `500` `1000` `2000` `4000` `8000` `16000` | CONFIG1 data rate. Omit the number to query. |
+| `gain` | channel, `1\|2\|4\|6\|8\|12\|24` | PGA gain. |
+| `power` | channel, `on\|off` | Channel power. Off also shorts the input. |
+| `input` | channel, `normal\|shorted\|bias\|mvdd\|temp\|test\|bias_drp\|bias_drn` | CHnSET mux. |
+| `srb1` | `on\|off` | MISC1 SRB1 (all N inputs). |
+| `srb2` | channel or `all`, `on\|off` | Per-channel SRB2 switch. |
+| `bias` | `on\|off` | Bias amplifier and internal bias reference. |
+| `biasp` `biasn` | hex mask | BIAS_SENSP / BIAS_SENSN. |
+| `biasch` | channel, `on\|off` | Include that channel in both bias senses. |
+| `loff` | `on\|off` | Lead-off comparators (CONFIG4). |
+| `loffp` `loffn` | hex mask | LOFF_SENSP / LOFF_SENSN. |
+| `loffch` | channel, P `0\|1`, N `0\|1` | Lead-off sense for one channel. |
+| `loff_current` | `6nA` `24nA` `6uA` `24uA` | ADS1299 lead-off magnitude. |
+| `loff_freq` | `dc` `7.8` `31.2` `fdr4` | Lead-off frequency. |
+| `testsignal` | `off` `dc` `slow` `fast` `slow2` `fast2` `ground` | CONFIG2 test source, and the mux of every present channel. |
+| `testamp` | `1` or `2` | Test amplitude `(VREFP-VREFN)/2400` or twice that. |
+| `defaults` | | Same referential setup as boot (`d`). |
+| `dropped` | | `ring_dropped`, `drdy_missed`, `radio_dropped`, `produced`. |
+| `regs` | | Registers `0x00`–`0x17` as `RR=VV` pairs. |
+| `led` `boardled` | `on\|off` | ESP32 LED, or ADS1299 GPIO4. |
+| `text` `jsonlines` `messagepack` `base64` `hex` | | USB protocol only. |
+
+The same words work on the USB text port without the pipes (`srb1 on`, `wreg 03 EC`).
+
+### WiFi
+
+Leave the station SSID empty and the board starts an access point `HackEEG`, password `openbci123`, at **192.168.4.1**. To join a router, uncomment `HACKEEG_STA_SSID` and `HACKEEG_STA_PASSWORD` in `hackeeg_driver/wifi_secrets.h`, or pass `-DHACKEEG_STA_SSID=\"name\"` and `-DHACKEEG_STA_PASSWORD=\"secret\"`. If the join does not succeed within 12 seconds, the board falls back to the access point. HTTP is port 80.
+
+| Request | Role |
+| --- | --- |
+| `GET /board` | `board_connected`, `board_type` (`cyton` or `none`), `num_channels` 8, `gains`, plus `chip_channels` and the drop counters. |
+| `POST /tcp` | JSON `ip`, `port`, `output` (`raw` or `json`), `delimiter`, `latency`. The ESP32 connects **to that computer** and, once streaming, writes samples. |
+| `POST /udp` | Same JSON. One datagram per sample. `"redundancy": true` sends it three times. |
+| `POST /command` | `{"command":"~4"}` or `{"command":"|status|"}`. |
+| `GET /stream/start` | Start WiFi streaming (`b`). |
+| `GET /stream/stop` | Stop WiFi streaming. Bluetooth keeps streaming if it was started separately. |
+| `GET /stats` | Drop counters, sample rate, streaming flag. |
+
+`raw` output is concatenated 33-byte packets with no extra delimiter bytes. `delimiter` inserts `\r\n` only in `json` mode. `latency` is accepted and reported; packets are sent on the next loop pass rather than held for that many microseconds. `ip_port` in BrainFlow is a port on the computer, not on the ESP32.
+
+BrainFlow (`CYTON_WIFI_BOARD`):
+
+```python
+from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
+
+params = BrainFlowInputParams()
+params.ip_address = "192.168.4.1"  # or the station address printed at boot
+params.ip_port = 6677              # free TCP port on this computer
+BoardShim.enable_dev_board_logger()
+board = BoardShim(BoardIds.CYTON_WIFI_BOARD, params)
+board.prepare_session()            # GET /board, POST /tcp, then ~4 (1000 SPS)
+board.start_stream()               # GET /stream/start
+data = board.get_board_data()
+board.stop_stream()
+board.release_session()
+```
+
+In the OpenBCI GUI choose Cyton over WiFi and enter that IP. `prepare_session` sends `~4`, so a BrainFlow WiFi session runs at 1000 SPS even though the sketch boots at 250. Channels 7 and 8 read as zero on an ADS1299-6.
+
+### Bluetooth
+
+Classic SPP name `HackEEG` (override with `-DHACKEEG_BT_NAME=\"name\"`). Pair, open the serial port, and use the GUI's Cyton (serial / dongle) mode, or BrainFlow `BoardIds.CYTON_BOARD` with `params.serial_port` set to that port. The port speaks `b` / `s` and the pipe commands. There is no PIN. The banner is sent when a client connects and ends with `$$$`.
+
+### Samples, the ring, and dropped counts
+
+DRDY is falling-edge. The interrupt only wakes a high-priority FreeRTOS task; SPI is not done in the interrupt. That task clocks one frame out and pushes a slot into a 512-deep ring. `loop()` drains the ring onto USB (HackEEG format, only after `rdatac`), WiFi, and Bluetooth. A stalled `write` does not have to finish before the next SPI read. When the ring is full the newest sample is counted in `ring_dropped` and is not stored.
+
+`drdy_missed` counts extra DRDY edges that arrived before the previous frame was clocked out. The sample number jumps by that many so the gap is visible in the packet counter. `radio_dropped` counts a packet that WiFi or Bluetooth did not accept. `produced` is how many frames were pushed. Read them with `|dropped|`, USB `status` or `dropped`, or `GET /stats`.
+
+The ring is about 2 seconds at 250 SPS and about 0.5 seconds at 1000 SPS. USB serial on a DevKit is 115200 baud, so the HackEEG JSON/MessagePack stream on USB is the slow path. Use WiFi or Bluetooth for 250–1000 SPS. These rates are from the 33-byte packet size, not a measurement on a board:
+
+| Transport | Rate that should fit |
+| --- | --- |
+| USB serial at 115200, HackEEG text/JSON | Below 250 SPS once the line is base64 or JSON. |
+| Classic SPP | 250 SPS, often 1000 SPS (about 33 KB/s). |
+| WiFi TCP | 250 SPS through a few thousand SPS. 1000 SPS is 33 KB/s. |
+| WiFi UDP | Same order as TCP. Loss shows up as sample-number gaps. |
+
+### Build
+
+Install [arduino-cli](https://arduino.github.io/arduino-cli/), the ESP32 core, and ArduinoJson 6:
+
+```bash
+arduino-cli config init
+arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+arduino-cli core update-index
+arduino-cli core install esp32:esp32
+arduino-cli lib install "ArduinoJson@6.21.5"
+```
+
+The default 1.2 MB app partition is too small (the binary is about 1.7 MB). Huge APP is 3 MB and has no OTA slot. In the Arduino IDE: board **ESP32 Dev Module**, **Tools → Partition Scheme → Huge APP (3MB No OTA/1MB SPIFFS)**.
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app hackeeg_driver
+```
+
+Force a 6-channel frame even if you want the fallback compiled in:
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app \
+  --build-property "compiler.cpp.extra_flags=-DHACKEEG_CHANNEL_COUNT=6" \
+  hackeeg_driver
+```
+
+Checked with arduino-cli, ESP32 core 3.3.12, and ArduinoJson 6.21.5: `esp32:esp32:esp32:PartitionScheme=huge_app` compiles (about 1.69 MB, 53% of Huge APP). The Arduino Due target (`arduino:sam:arduino_due_x`) also compiles. No ADS1299 was attached, so DRDY timing and radio throughput were not measured on hardware.
 
 ## Credits
 

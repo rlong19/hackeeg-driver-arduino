@@ -20,10 +20,11 @@
  */
 
 // uncomment for debugging on Serial interface (programming port)
-// you must connect to Serial port first, then SerialUSB, since Serial will reset the Arduino Due
+// you must connect to Serial port first, then HACKEEG_SERIAL, since Serial will reset the Arduino Due
 //#define JSONCOMMAND_DEBUG 1
 
 #include "JsonCommand.h"
+#include "BoardConfig.h"
 
 const char *COMMAND_KEY = "COMMAND";
 const char *PARAMETERS_KEY = "PARAMETERS";
@@ -100,8 +101,8 @@ void JsonCommand::setDefaultHandler(void (*func)(const char *)) {
  */
 void JsonCommand::readSerial() {
     StaticJsonDocument<1024> json_command;
-    while (SerialUSB.available() > 0) {
-        char inChar = SerialUSB.read();   // Read single available character, there may be more waiting
+    while (HACKEEG_SERIAL.available() > 0) {
+        char inChar = HACKEEG_SERIAL.read();   // Read single available character, there may be more waiting
 #ifdef JSONCOMMAND_DEBUG
         Serial.print(inChar);   // Echo back to serial stream
 #endif
@@ -125,7 +126,7 @@ void JsonCommand::readSerial() {
             }
 
             JsonObject command_object = json_command.as<JsonObject>();
-            JsonVariant command_name_variant = command_object.getMember(COMMAND_KEY);
+            JsonVariant command_name_variant = command_object[COMMAND_KEY];
             if (command_name_variant.isNull()) {
 #ifdef JSONCOMMAND_DEBUG
                 Serial.println(F("Error: no command"));
@@ -144,7 +145,7 @@ void JsonCommand::readSerial() {
 #ifdef JSONCOMMAND_DEBUG
             Serial.println(commandList[command_num].command);
 #endif
-            JsonVariant parameters_variant = json_command.getMember(PARAMETERS_KEY);
+            JsonVariant parameters_variant = json_command[PARAMETERS_KEY];
             unsigned char register_number = 0;
             unsigned char register_value = 0;
             if (!parameters_variant.isNull()) {
@@ -194,14 +195,14 @@ void JsonCommand::sendJsonLinesResponse(int status_code, char *status_text) {
     JsonObject root = doc.to<JsonObject>();
     root[STATUS_CODE_KEY] = status_code;
     root[STATUS_TEXT_KEY] = status_text;
-    serializeJson(doc, SerialUSB);
-    SerialUSB.println();
+    serializeJson(doc, HACKEEG_SERIAL);
+    HACKEEG_SERIAL.println();
     doc.clear();
 }
 
 void JsonCommand::sendJsonLinesDocResponse(JsonDocument &doc) {
-    serializeJson(doc, SerialUSB);
-    SerialUSB.println();
+    serializeJson(doc, HACKEEG_SERIAL);
+    HACKEEG_SERIAL.println();
     doc.clear();
 }
 
@@ -212,12 +213,12 @@ void JsonCommand::sendMessagePackResponse(int status_code, char *status_text) {
     if (!status_text) {
         root[MP_STATUS_TEXT_KEY] = status_text;
     }
-    serializeMsgPack(doc, SerialUSB);
+    serializeMsgPack(doc, HACKEEG_SERIAL);
     doc.clear();
 }
 
 void JsonCommand::sendMessagePackDocResponse(JsonDocument &doc) {
-    serializeMsgPack(doc, SerialUSB);
+    serializeMsgPack(doc, HACKEEG_SERIAL);
     doc.clear();
 }
 

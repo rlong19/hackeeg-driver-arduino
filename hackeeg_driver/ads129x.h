@@ -81,6 +81,10 @@ enum reg {
     // other
             GPIO = 0x14,
     PACE = 0x15,
+    // ADS1299 name for address 0x15. Bit 5 (0x20) closes SRB1.
+    MISC1 = 0x15,
+    BIAS_SENSP = 0x0d,
+    BIAS_SENSN = 0x0e,
     RESP = 0x16,
     CONFIG4 = 0x17,
     WCT1 = 0x18,
@@ -244,6 +248,9 @@ enum CHnSET_bits {
     ADS1298_GAIN_6X = 0x00,
     ADS1298_GAIN_8X = (GAINn2 | GAINn0),
     ADS1298_GAIN_12X = (GAINn2 | GAINn1),
+
+    // ADS1299 CHnSET bit 3 connects the positive input to SRB2.
+    SRB2 = 0x08,
 
     ELECTRODE_INPUT = 0x00,
     SHORTED = MUXn0,
